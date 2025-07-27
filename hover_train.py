@@ -2,6 +2,7 @@ import argparse
 import os
 import pickle
 import shutil
+import torch
 from importlib import metadata
 
 try:
@@ -88,9 +89,14 @@ def get_cfgs():
         "visualize_target": False,
         "visualize_camera": False,
         "max_visualize_FPS": 60,
+        # obstacles
+        "obstacles" : True,
+        "obstacles_num" : 4,
+        # "obstacles_pos" : ["around", "under", "front"]
+        "obstacles_pos" : ["around"]
     }
     obs_cfg = {
-        "num_obs": 17,
+        "num_obs": 17, # 8 is LLM's output's dim (if add LLM, plus 8dim)
         "obs_scales": {
             "rel_pos": 1 / 3.0,
             "lin_vel": 1 / 3.0,
@@ -105,6 +111,7 @@ def get_cfgs():
             "yaw": 0.01,
             "angular": -2e-4,
             "crash": -10.0,
+            "y_height":2.0,
         },
     }
     command_cfg = {

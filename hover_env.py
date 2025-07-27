@@ -1,6 +1,11 @@
 import torch
 import math
 import copy
+import random
+
+from sentence_transformers import SentenceTransformer
+from sklearn.decomposition import PCA
+
 import genesis as gs
 from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat, transform_quat_by_quat
 
@@ -54,11 +59,8 @@ class HoverEnv:
         self.scene.add_entity(gs.morphs.Plane())
         
         self.obstacles = []
-        self.obstacles_pos = env_cfg["obstacles"]["pos"]
-        self.obstacles_size = env_cfg["obstacles"]["size"]
-        self.obstacles_idxes = range(len(self.obstacles_pos))
-
-
+        self.obstacles_size = (0.1, 0.1, 1.0)
+        self.obstacles_size_half = (0.05, 0.05, 0.5)
         # add target
         if self.env_cfg["visualize_target"]:
             self.target = self.scene.add_entity(
@@ -74,6 +76,18 @@ class HoverEnv:
                     ),
                 ),
             )
+
+            if self.env_cfg["obstacles"]:
+                for _ in range(self.env_cfg["obstacles_num"]):
+                    self.obstacles.append(
+                        self.scene.add_entity(
+                            gs.morphs.Box(
+                                size=self.obstacles_size,
+                                fixed=True,
+                                collision=True,
+                            )
+                        )
+                    )
         else:
             self.target = None
 
@@ -109,6 +123,7 @@ class HoverEnv:
         self.reset_buf = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         self.episode_length_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         self.commands = torch.zeros((self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)
+        self.obstacles_pos = torch.zeros((self.env_cfg["obstacles_num"], self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)
 
         self.actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
         self.last_actions = torch.zeros_like(self.actions)
@@ -122,6 +137,19 @@ class HoverEnv:
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
 
+        self.obstacles_kinds = torch.zeros((self.num_envs))
+
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')  # 384次元ベクトル出力
+        self.pca = pca = PCA(n_components=8)
+        self.instraction = [
+            "高く上昇してから目標に向かえ",
+            "下降してから目標に向かえ",
+            "指示なし"
+        ]
+
+        self.instraction_features = self.pca.fit_transform(self.model.encode(self.instraction))
+        self.instraction_idx = torch.zeros((self.num_envs, ), device=gs.device, dtype=gs.tc_float)
+
     def _resample_commands(self, envs_idx):
         self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["pos_x_range"], (len(envs_idx),), gs.device)
         self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["pos_y_range"], (len(envs_idx),), gs.device)
@@ -131,6 +159,28 @@ class HoverEnv:
         # このtarget (=self.commands)を主軸に考えればよいのでは？<=「ターゲットの四方ooに障害物があります」とか「ターゲットの正面oo先に障害物があります」とか「ooの上にターゲットが置かれています」とか
         # こうすることでターゲットの埋もれた判定とか、障害物のランダム生成をしなくてよくなる
         # self.commandsと同様に管理・生成できる
+        obstacles_poskind_idx = random.choice(range(len(self.env_cfg["obstacles_pos"])))
+        self.obstacles_kinds[envs_idx] = obstacles_poskind_idx
+
+        obstacles_poskind = self.env_cfg["obstacles_pos"][obstacles_poskind_idx]
+        pos_biases = []
+
+        if obstacles_poskind == "around":
+            pos_biases.append(torch.tensor([0.15,0,0], device=gs.device, dtype=gs.tc_float))
+            pos_biases.append(torch.tensor([-0.15,0,0], device=gs.device, dtype=gs.tc_float))
+            pos_biases.append(torch.tensor([0,0.15,0], device=gs.device, dtype=gs.tc_float))
+            pos_biases.append(torch.tensor([0,-0.15,0], device=gs.device, dtype=gs.tc_float))
+        # elif obstacles_poskind == "under":
+        #     slope = commands[envs_idx, 1] / commands[envs_idx, 0]
+        # elif obstacles_poskind == "front":
+        #     slope = commands[envs_idx, 1] / commands[envs_idx, 0]
+
+        for i in range(self.env_cfg["obstacles_num"]):
+            self.obstacles_pos[i][envs_idx, 0] = pos_biases[i][0] + self.commands[envs_idx, 0]
+            self.obstacles_pos[i][envs_idx, 1] = pos_biases[i][1] + self.commands[envs_idx, 1]
+            self.obstacles_pos[i][envs_idx, 2] = pos_biases[i][2] + self.commands[envs_idx, 2]
+
+        self.instraction_idx = random.choice(range(len(self.instraction)))
 
     def _at_target(self):
         return (
@@ -148,6 +198,10 @@ class HoverEnv:
         # update target pos
         if self.target is not None:
             self.target.set_pos(self.commands, zero_velocity=True)
+            if self.env_cfg["obstacles"]:
+                for i in range(self.env_cfg["obstacles_num"]):
+                    self.obstacles[i].set_pos(self.obstacles_pos[i])
+
         self.scene.step()
 
         # update buffers
@@ -179,7 +233,8 @@ class HoverEnv:
             | (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
             | (self.base_pos[:, 2] < self.env_cfg["termination_if_close_to_ground"])
         )
-        self.reset_buf = (self.episode_length_buf > self.max_episode_length) | self.crash_condition
+        self.hit_obstacle()
+        self.reset_buf = (self.episode_length_buf > self.max_episode_length) | self.crash_condition | self.hit
 
         time_out_idx = (self.episode_length_buf > self.max_episode_length).nonzero(as_tuple=False).reshape((-1,))
         self.extras["time_outs"] = torch.zeros_like(self.reset_buf, device=gs.device, dtype=gs.tc_float)
@@ -202,6 +257,7 @@ class HoverEnv:
                 torch.clip(self.base_lin_vel * self.obs_scales["lin_vel"], -1, 1),
                 torch.clip(self.base_ang_vel * self.obs_scales["ang_vel"], -1, 1),
                 self.last_actions,
+                self.instraction_features[self.instraction_idx]
             ],
             axis=-1,
         )
@@ -240,9 +296,7 @@ class HoverEnv:
         self.reset_buf[envs_idx] = True
 
         # reset obstacles
-        self.obstacles[envs_idx] = []
-
-        
+        # self.obstacles_pos[:,envs_idx,:] = torch.tensor([0,0,0], device=gs.device, dtype=gs.tc_float)
 
         # fill extras
         self.extras["episode"] = {}
@@ -259,15 +313,14 @@ class HoverEnv:
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
         return self.obs_buf, None
     
-    def create_obstacle(self, pos, size):
-        self.obstacles.append(self.scene.add_entity(
-            gs.morphs.Box(
-                pos=pos,
-                size=size,
-                fixed=True,
-                collision=True,
-            )))
-
+    def hit_obstacle(self):
+        self.hit = self.base_pos[:,0] is None
+        for i in range(self.env_cfg["obstacles_num"]):
+            # print(i)
+            x_hit_range = ((self.obstacles_pos[i][:,0] - self.obstacles_size_half[0]) < self.base_pos[:,0]) & (self.base_pos[:,0] < (self.obstacles_pos[i][:,0] + self.obstacles_size_half[0]))
+            y_hit_range = ((self.obstacles_pos[i][:,1] - self.obstacles_size_half[1]) < self.base_pos[:,1]) & (self.base_pos[:,1] < (self.obstacles_pos[i][:,1] + self.obstacles_size_half[1]))
+            z_hit_range = ((self.obstacles_pos[i][:,2] - self.obstacles_size_half[2]) < self.base_pos[:,2])& (self.base_pos[:,2] < (self.obstacles_pos[i][:,2] + self.obstacles_size_half[2]))
+            self.hit = self.hit | (x_hit_range & y_hit_range & z_hit_range)
     # ------------ reward functions----------------
     def _reward_target(self):
         target_rew = torch.sum(torch.square(self.last_rel_pos), dim=1) - torch.sum(torch.square(self.rel_pos), dim=1)
@@ -286,6 +339,10 @@ class HoverEnv:
     def _reward_angular(self):
         angular_rew = torch.norm(self.base_ang_vel / 3.14159, dim=1)
         return angular_rew
+    
+    def _reward_yheight(self):
+        torch.where(self.instraction_idx == 1, self.commands[:,2] + 1 )
+
 
     def _reward_crash(self):
         crash_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)

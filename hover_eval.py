@@ -56,7 +56,7 @@ def main():
     policy = runner.get_inference_policy(device=gs.device)
 
     obs, _ = env.reset()
-    print("first obs",obs)
+    # print("first obs",obs)
 
     max_sim_step = int(env_cfg["episode_length_s"] * env_cfg["max_visualize_FPS"])
     with torch.no_grad():
@@ -65,14 +65,14 @@ def main():
             for i in range(max_sim_step):
                 actions = policy(obs)
                 obs, rews, dones, infos = env.step(actions)
-                print(f"step {i}' obs ; ",obs)
+                # print(f"step {i}' obs ; ",obs)
                 env.cam.render()
             env.cam.stop_recording(save_to_filename="video.mp4", fps=env_cfg["max_visualize_FPS"])
         else:
             for i in range(max_sim_step):
                 actions = policy(obs)
                 obs, rews, dones, infos = env.step(actions)
-                print(f"step {i}' obs ; ",obs)
+                # print(f"step {i}' obs ; ",obs)
 
 
 if __name__ == "__main__":
