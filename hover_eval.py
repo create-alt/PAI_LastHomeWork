@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="drone-hovering")
     parser.add_argument("--ckpt", type=int, default=300)
-    parser.add_argument("--record", action="store_true", default=False)
+    parser.add_argument("--record", action="store_true", default=True)
     args = parser.parse_args()
 
     gs.init()
@@ -47,6 +47,7 @@ def main():
         obs_cfg=obs_cfg,
         reward_cfg=reward_cfg,
         command_cfg=command_cfg,
+        prompt_idx = 7,
         show_viewer=True,
     )
 
@@ -58,7 +59,7 @@ def main():
     obs, _ = env.reset()
     # print("first obs",obs)
 
-    max_sim_step = int(env_cfg["episode_length_s"] * env_cfg["max_visualize_FPS"])
+    max_sim_step = int(env_cfg["episode_length_s"] * env_cfg["max_visualize_FPS"]*2)
     with torch.no_grad():
         if args.record:
             env.cam.start_recording()

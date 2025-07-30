@@ -15,7 +15,7 @@ def gs_rand_float(lower, upper, shape, device):
 
 
 class HoverEnv:
-    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
+    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, prompt_idx=None, show_viewer=False):
         self.num_envs = num_envs
         self.rendered_env_num = min(10, self.num_envs)
         self.num_obs = obs_cfg["num_obs"]
@@ -140,15 +140,27 @@ class HoverEnv:
         self.obstacles_kinds = torch.zeros((self.num_envs))
 
         self.model = SentenceTransformer('all-MiniLM-L6-v2')  # 384次元ベクトル出力
-        self.pca = pca = PCA(n_components=8)
+        self.pca = PCA(n_components=8)
         self.instraction = [
+            "指示なし",
             "高く上昇してから目標に向かえ",
+            "上に十分飛んだ後目標に向かえ",
+            "目標の四方には高い壁があるためこれを超えるようにあらかじめ上昇しろ",
+            "まっすぐ上昇してから進め"
             "下降してから目標に向かえ",
-            "指示なし"
+            "低く下降してから目標に向かえ",
+            "高度を十分下げた後目標に向かえ",
+            "目標の四方には大きな壁があるためこれを下からくぐるためにあらかじめ下降しろ",
+            "まっすぐ下降してから進め"
         ]
 
-        self.instraction_features = self.pca.fit_transform(self.model.encode(self.instraction))
-        self.instraction_idx = torch.zeros((self.num_envs, ), device=gs.device, dtype=gs.tc_float)
+        self.instraction_features = torch.tensor(self.pca.fit_transform(self.model.encode(self.instraction)), device=gs.device, dtype=gs.tc_float)
+        self.instraction_idx = torch.zeros((self.num_envs, ), device=gs.device, dtype=gs.tc_int)
+        if prompt_idx is not None:
+            self.instraction_idx[:] = prompt_idx
+        self.prompt_idx = prompt_idx
+
+        # self.reset_envs = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_bool)
 
     def _resample_commands(self, envs_idx):
         self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["pos_x_range"], (len(envs_idx),), gs.device)
@@ -165,22 +177,33 @@ class HoverEnv:
         obstacles_poskind = self.env_cfg["obstacles_pos"][obstacles_poskind_idx]
         pos_biases = []
 
+        if self.prompt_idx is None:
+            self.instraction_idx[envs_idx] = random.choice(range(len(self.instraction)))
+        else:
+            self.instraction_idx[envs_idx] = self.prompt_idx
+
         if obstacles_poskind == "around":
-            pos_biases.append(torch.tensor([0.15,0,0], device=gs.device, dtype=gs.tc_float))
-            pos_biases.append(torch.tensor([-0.15,0,0], device=gs.device, dtype=gs.tc_float))
-            pos_biases.append(torch.tensor([0,0.15,0], device=gs.device, dtype=gs.tc_float))
-            pos_biases.append(torch.tensor([0,-0.15,0], device=gs.device, dtype=gs.tc_float))
+            pos_biases.append(torch.tensor([0.2,0,0], device=gs.device, dtype=gs.tc_float))
+            pos_biases.append(torch.tensor([-0.2,0,0], device=gs.device, dtype=gs.tc_float))
+            pos_biases.append(torch.tensor([0,0.2,0], device=gs.device, dtype=gs.tc_float))
+            pos_biases.append(torch.tensor([0,-0.2,0], device=gs.device, dtype=gs.tc_float))
         # elif obstacles_poskind == "under":
         #     slope = commands[envs_idx, 1] / commands[envs_idx, 0]
         # elif obstacles_poskind == "front":
         #     slope = commands[envs_idx, 1] / commands[envs_idx, 0]
-
+        
+        pos_biases_0 =  [torch.tensor([0.2,0,-5.0], device=gs.device, dtype=gs.tc_float), 
+                            torch.tensor([-0.2,0,-5.0], device=gs.device, dtype=gs.tc_float),
+                            torch.tensor([0,0.2,-5.0], device=gs.device, dtype=gs.tc_float),
+                            torch.tensor([0,-0.2,-5.0], device=gs.device, dtype=gs.tc_float)]
+        
+        valid_indices = torch.isin(self.instraction_idx[envs_idx], torch.tensor([0,], device=gs.device, dtype=gs.tc_float))
         for i in range(self.env_cfg["obstacles_num"]):
-            self.obstacles_pos[i][envs_idx, 0] = pos_biases[i][0] + self.commands[envs_idx, 0]
-            self.obstacles_pos[i][envs_idx, 1] = pos_biases[i][1] + self.commands[envs_idx, 1]
-            self.obstacles_pos[i][envs_idx, 2] = pos_biases[i][2] + self.commands[envs_idx, 2]
+            self.obstacles_pos[i][envs_idx, 0] = torch.where(valid_indices, pos_biases_0[i][0] , pos_biases[i][0] + self.commands[envs_idx, 0])
+            self.obstacles_pos[i][envs_idx, 1] = torch.where(valid_indices, pos_biases_0[i][0] , pos_biases[i][1] + self.commands[envs_idx, 1])
+            self.obstacles_pos[i][envs_idx, 2] = torch.where(valid_indices, pos_biases_0[i][0] , pos_biases[i][2] + self.commands[envs_idx, 2])
 
-        self.instraction_idx = random.choice(range(len(self.instraction)))
+        
 
     def _at_target(self):
         return (
@@ -250,6 +273,8 @@ class HoverEnv:
             self.episode_sums[name] += rew
 
         # compute observations
+        # print(self.instraction_features[self.instraction_idx])
+        # print(self.instraction_idx)
         self.obs_buf = torch.cat(
             [
                 torch.clip(self.rel_pos * self.obs_scales["rel_pos"], -1, 1),
@@ -324,6 +349,7 @@ class HoverEnv:
     # ------------ reward functions----------------
     def _reward_target(self):
         target_rew = torch.sum(torch.square(self.last_rel_pos), dim=1) - torch.sum(torch.square(self.rel_pos), dim=1)
+        # target_rew = torch.where(torch.norm(self.rel_pos, dim=1) < self.env_cfg["at_target_threshold"], 10, 0.)
         return target_rew
 
     def _reward_smooth(self):
@@ -340,8 +366,34 @@ class HoverEnv:
         angular_rew = torch.norm(self.base_ang_vel / 3.14159, dim=1)
         return angular_rew
     
-    def _reward_yheight(self):
-        torch.where(self.instraction_idx == 1, self.commands[:,2] + 1 )
+    def _reward_height(self):
+        episode_condition = self.episode_length_buf < (self.max_episode_length / 3)
+        high_condition = (self.last_base_pos[:,2] < self.base_pos[:,2]) & (self.base_pos[:,2] < self.command_cfg["pos_z_range"][1] * 2)
+        low_condition  = (self.last_base_pos[:,2] > self.base_pos[:,2]) & (self.base_pos[:,2] > 0)
+
+        high_indices = torch.isin(self.instraction_idx, torch.tensor([1, 2, 3, 4], device=gs.device, dtype=gs.tc_float))
+        low_indices = torch.isin(self.instraction_idx, torch.tensor([5, 6, 7, 8], device=gs.device, dtype=gs.tc_float))
+
+        height_rew = torch.where(high_indices & high_condition & episode_condition, 1, 0.)
+        height_rew += torch.where(low_indices & low_condition & episode_condition, 1, 0.)
+
+        episode_penalty_condition = self.episode_length_buf > (self.max_episode_length * 2/ 3)
+        
+        # 高さが高いまま降下しなければペナルティ
+        height_penalty = torch.max((self.base_pos[:,2] - self.commands[:,2]) + 0.3, torch.zeros_like(self.base_pos[:,2]))
+        height_rew -= torch.where(episode_penalty_condition & high_indices, height_penalty, 0.)
+
+        # 高さが低いまま上昇しなければペナルティ
+        height_penalty = torch.max((self.commands[:,2] - self.base_pos[:,2]) + 0.3, torch.zeros_like(self.base_pos[:,2]))
+        height_rew -= torch.where(episode_penalty_condition & low_indices, height_penalty, 0.)
+
+        return height_rew
+    
+    def _reward_xytarget(self):
+        xytarget_rew = torch.where((abs(self.base_pos[:,0] - self.commands[:,0]) < 0.1) & (abs(self.base_pos[:,1] - self.commands[:,1]) < 0.1), 1, -0.1)
+
+        return xytarget_rew
+    # def _reward_time(self):
 
 
     def _reward_crash(self):

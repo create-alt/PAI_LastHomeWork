@@ -96,7 +96,7 @@ def get_cfgs():
         "obstacles_pos" : ["around"]
     }
     obs_cfg = {
-        "num_obs": 17, # 8 is LLM's output's dim (if add LLM, plus 8dim)
+        "num_obs": 17 + 8, # 8 is LLM's output's dim (if add LLM, plus 8dim)
         "obs_scales": {
             "rel_pos": 1 / 3.0,
             "lin_vel": 1 / 3.0,
@@ -111,14 +111,15 @@ def get_cfgs():
             "yaw": 0.01,
             "angular": -2e-4,
             "crash": -10.0,
-            "y_height":2.0,
+            "height":2,
+            "xytarget":2,
         },
     }
     command_cfg = {
         "num_commands": 3,
         "pos_x_range": [-1.0, 1.0],
         "pos_y_range": [-1.0, 1.0],
-        "pos_z_range": [1.0, 1.0],
+        "pos_z_range": [0.75, 1.25],
     }
 
     return env_cfg, obs_cfg, reward_cfg, command_cfg
